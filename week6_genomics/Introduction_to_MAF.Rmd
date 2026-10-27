@@ -1,0 +1,275 @@
+---
+title: "Introduction to MAF"
+author: Joshua Lin, Christopher Kim, Erika Li, Jeanne Revilla, Mahija Mogalipuvvu, adapted from Nicole Black, Wade Boohar
+date: 07/17/22
+updated: 10/12/2026
+output: html_document
+---
+
+***Deliverables***
+- upload this R Notebook to your GitHub and submit the link to your Repo on Brightspace
+- include ALL graphs or figures created in this assignment in a folder with your R notebook with descriptive file names.
+
+We encourage you to work with a partner. Therefore, it is okay if your answers are the same as your partner’s as long as everyone understands it and could explain it in their own words if asked. Each person must individually push their code to Github. *If you do work with a partner, at the top of your R Notebook, write the name of you and your partner(s) as a comment.*
+
+***Complete the following coding activity and answer any following questions as comments in your R Notebook***
+
+In this assignment, you will need to use your skills learned in class to demonstrate your understanding of categorical variables and R data structures.
+
+*Pre-Assignment*
+Load all necessary packages, read in the clinical data.csv file you have in your analysis_data folder, and instantiate the MAF_object.
+```{r setup, message=FALSE}
+# Puyuan Li
+analysis_dir <- path.expand("~/490_cluster/analysis_data")
+notebook_dir <- path.expand("~/490_cluster/week6_genomics")
+figure_dir <- file.path(notebook_dir, "figures")
+if (!dir.exists(analysis_dir)) stop("Cannot find ", analysis_dir)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(analysis_dir))
+for (pkg in c("maftools", "survival", "data.table")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Install ", pkg, " in the CARC RStudio Console, restart R, and Knit again.")
+  }
+}
+
+clinical_file <- file.path(analysis_dir, "brca_clinical_data.csv")
+if (!file.exists(clinical_file)) {
+  stop("Cannot find ", clinical_file, ". Run the Week 5 clinical notebook first.")
+}
+clinic <- read.csv(clinical_file, stringsAsFactors = FALSE, check.names = FALSE,
+                   na.strings = c("", "NA", "[Not Available]", "[Not Applicable]"))
+if ("bcr_patient_barcode" %in% names(clinic)) {
+  names(clinic)[names(clinic) == "bcr_patient_barcode"] <- "Tumor_Sample_Barcode"
+}
+needed <- c("Tumor_Sample_Barcode", "breast_carcinoma_estrogen_receptor_status",
+            "vital_status", "last_contact_days_to", "death_days_to")
+if (!all(needed %in% names(clinic))) {
+  stop("Clinical data is missing: ", paste(setdiff(needed, names(clinic)), collapse = ", "))
+}
+clinic$Tumor_Sample_Barcode <- substr(as.character(clinic$Tumor_Sample_Barcode), 1, 12)
+clinic <- clinic[!is.na(clinic$Tumor_Sample_Barcode) &
+                   !duplicated(clinic$Tumor_Sample_Barcode), , drop = FALSE]
+```
+
+The MAF files downloaded in Materials Download Part 2 are reused here. The first run creates an RDS file in `analysis_data`; later runs use that file.
+```{r load-maf}
+maf_rds <- file.path(analysis_dir, "maf_object.rds")
+if (file.exists(maf_rds)) {
+  MAF_object <- readRDS(maf_rds)
+  if (!methods::is(MAF_object, "MAF")) stop("maf_object.rds does not contain a MAF object.")
+  saved_barcodes <- as.character(maftools::getSampleSummary(MAF_object)$Tumor_Sample_Barcode)
+  if (any(nchar(saved_barcodes) != 12L)) {
+    # Make sample barcodes patient-level to match the clinical patient table.
+    maf_data <- data.table::rbindlist(list(MAF_object@data, MAF_object@maf.silent),
+                                      use.names = TRUE, fill = TRUE)
+    MAF_object <- maftools::read.maf(maf = maf_data, clinicalData = clinic,
+                                    isTCGA = TRUE)
+  }
+} else {
+  maf_files <- list.files(analysis_dir, pattern = "[.]maf([.]gz)?$",
+                          recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+  if (!length(maf_files)) {
+    stop("No downloaded MAF files found under ", analysis_dir,
+         ". The mutation download from Materials Download Part 2 is needed.")
+  }
+  if (length(maf_files) == 1L) {
+    maf_data <- maf_files[[1L]]
+  } else {
+    maf_data <- data.table::rbindlist(lapply(maf_files, function(f) {
+      data.table::fread(f, sep = "\t", skip = "Hugo_Symbol", quote = "",
+                        fill = TRUE, showProgress = FALSE)
+    }), use.names = TRUE, fill = TRUE)
+  }
+  MAF_object <- maftools::read.maf(maf = maf_data, clinicalData = clinic,
+                                  isTCGA = TRUE)
+}
+saveRDS(MAF_object, file = maf_rds)
+MAF_object <- readRDS(file = maf_rds)
+print(MAF_object)
+```
+
+*1*
+Choose a clinical variable (or any variable from clin_rad or clin_drug) to separate your populations into two different groups and rewrite the column or create a new column with that variable as a factor. ***Do not use age or vital_status as your clinical variable.*** Hint: if your variable is continuous, you will need to determine your own cutoffs for the different levels of the factor. If your variable is categorical and has more than two possible values, choose the two that are the most common.
+```{r er-groups}
+# Use the two recorded estrogen receptor (ER) statuses; exclude unknown values.
+er_value <- tolower(trimws(as.character(clinic$breast_carcinoma_estrogen_receptor_status)))
+clinic$ER_status <- factor(ifelse(er_value == "negative", "Negative",
+                                   ifelse(er_value == "positive", "Positive", NA_character_)),
+                           levels = c("Negative", "Positive"))
+maf_samples <- unique(as.character(maftools::getSampleSummary(MAF_object)$Tumor_Sample_Barcode))
+cohort <- clinic[clinic$Tumor_Sample_Barcode %in% maf_samples &
+                   !is.na(clinic$ER_status), , drop = FALSE]
+print(table(cohort$ER_status))
+if (any(table(cohort$ER_status) < 2L)) {
+  stop("At least two sequenced patients per ER group are required.")
+}
+```
+
+
+*2*
+Create a co-oncoplot with the top 10-20 (you choose) most mutated genes for the two groups. Pick one that has a large discrepancy in % mutated or type of mutations between the groups and research it.
+Research it. What is the gene used for? Can you think of any reason for the discrepancy?
+```{r co-oncoplot}
+er_negative <- cohort$Tumor_Sample_Barcode[cohort$ER_status == "Negative"]
+er_positive <- cohort$Tumor_Sample_Barcode[cohort$ER_status == "Positive"]
+maf_negative <- maftools::subsetMaf(MAF_object, tsb = er_negative)
+maf_positive <- maftools::subsetMaf(MAF_object, tsb = er_positive)
+top_genes <- head(as.character(maftools::getGeneSummary(MAF_object)$Hugo_Symbol), 15)
+if (!"TP53" %in% top_genes) top_genes <- c(head(top_genes, 14), "TP53")
+
+oncoplot_file <- file.path(figure_dir, "ER_negative_vs_positive_top15_co_oncoplot.png")
+grDevices::png(oncoplot_file, width = 3600, height = 2300, res = 200)
+maftools::coOncoplot(m1 = maf_negative, m2 = maf_positive, genes = top_genes,
+                     m1Name = "ER negative", m2Name = "ER positive")
+grDevices::dev.off()
+knitr::include_graphics(oncoplot_file)
+
+# TP53 encodes p53, a tumor suppressor that responds to DNA damage by
+# limiting cell division or triggering repair/apoptosis. TCGA reported high
+# TP53 mutation frequency in basal-like tumors, which are often ER-negative,
+# and lower frequency in many luminal/ER-positive tumors. ER status and
+# molecular subtype overlap but are not identical; this is a possible
+# explanation for a difference, not evidence that ER status causes mutation.
+# Sources: https://medlineplus.gov/genetics/gene/tp53/
+# https://www.nature.com/articles/nature11412
+```
+
+
+*3*
+Create a contingency table with your variable and chosen gene. Run a Fisher’s Exact Test between presence of mutations for that gene and your clinical variable. Create and save a mosaic plot.
+Interpret the output of the Fisher’s Exact Test in terms of the odds ratio and p-value.
+```{r fisher-and-mosaic}
+# Count each sequenced patient once. maftools excludes silent calls by default.
+tp53_samples <- unique(as.character(maftools::subsetMaf(
+  MAF_object, genes = "TP53", mafObj = FALSE)$Tumor_Sample_Barcode))
+cohort$TP53_status <- factor(ifelse(cohort$Tumor_Sample_Barcode %in% tp53_samples,
+                                   "Mutated", "Not mutated"),
+                             levels = c("Mutated", "Not mutated"))
+contingency <- table(cohort$ER_status, cohort$TP53_status)
+print(contingency)
+fisher_result <- stats::fisher.test(contingency)
+print(fisher_result)
+
+mosaic_file <- file.path(figure_dir, "ER_status_TP53_mosaic.png")
+grDevices::png(mosaic_file, width = 1800, height = 1400, res = 200)
+graphics::mosaicplot(contingency, color = TRUE, main = "TP53 mutation by ER status",
+                     xlab = "ER status", ylab = "TP53 mutation")
+grDevices::dev.off()
+knitr::include_graphics(mosaic_file)
+
+# The odds ratio compares odds of a TP53 mutation in ER-negative patients
+# with odds in ER-positive patients (row/column order is fixed above).
+# An odds ratio above 1 favors ER-negative; below 1 favors ER-positive.
+# The two-sided p-value tests independence of TP53 mutation and ER status.
+rate_negative <- 100 * contingency["Negative", "Mutated"] / sum(contingency["Negative", ])
+rate_positive <- 100 * contingency["Positive", "Mutated"] / sum(contingency["Positive", ])
+cat(sprintf("TP53 mutated: ER-negative %.1f%%; ER-positive %.1f%%.\n",
+            rate_negative, rate_positive))
+cat(sprintf("Fisher odds ratio (ER-negative / ER-positive): %.3f; p-value: %s.\n",
+            unname(fisher_result$estimate), format.pval(fisher_result$p.value, digits = 3)))
+cat(if (rate_negative > rate_positive) {
+  "TP53 mutations are more frequent in the ER-negative group.\n"
+} else if (rate_negative < rate_positive) {
+  "TP53 mutations are more frequent in the ER-positive group.\n"
+} else {
+  "The two ER groups have the same observed TP53 mutation percentage.\n"
+})
+cat(if (fisher_result$p.value < 0.05) {
+  "At the 0.05 level, the data support an association; this is not causation.\n"
+} else {
+  "At the 0.05 level, the data do not establish an association.\n"
+})
+```
+
+
+*4*
+Subset your maf_object based on your chosen clinical variable and create a co-lollipop plot of your chosen gene divided between the two different clinical variable possibilities. Include descriptive names on your plot.
+Do you notice any difference in terms of mutations (e.g. sites, types, number) between the two populations?
+```{r co-lollipop}
+lollipop_file <- file.path(figure_dir, "TP53_ER_negative_vs_positive_co_lollipop.png")
+grDevices::png(lollipop_file, width = 3000, height = 1800, res = 200)
+maftools::lollipopPlot2(m1 = maf_negative, m2 = maf_positive, gene = "TP53",
+                        m1_name = "ER negative", m2_name = "ER positive")
+grDevices::dev.off()
+knitr::include_graphics(lollipop_file)
+
+tp53_negative <- maftools::subsetMaf(maf_negative, genes = "TP53", mafObj = FALSE)
+tp53_positive <- maftools::subsetMaf(maf_positive, genes = "TP53", mafObj = FALSE)
+most_common_class <- function(x) {
+  if (!nrow(x)) return("none")
+  names(sort(table(as.character(x$Variant_Classification)), decreasing = TRUE))[1]
+}
+cat(sprintf("ER-negative: %d TP53 variant calls in %d patients; most common type: %s.\n",
+            nrow(tp53_negative), length(unique(tp53_negative$Tumor_Sample_Barcode)),
+            most_common_class(tp53_negative)))
+cat(sprintf("ER-positive: %d TP53 variant calls in %d patients; most common type: %s.\n",
+            nrow(tp53_positive), length(unique(tp53_positive$Tumor_Sample_Barcode)),
+            most_common_class(tp53_positive)))
+site_field <- intersect(c("HGVSp_Short", "Protein_Change", "AAChange"),
+                        intersect(names(tp53_negative), names(tp53_positive)))[1]
+most_common_site <- function(x, field) {
+  if (!length(field) || is.na(field) || !nrow(x)) return("not available")
+  values <- as.character(x[[field]])
+  values <- values[!is.na(values) & nzchar(values)]
+  if (!length(values)) return("not available")
+  names(sort(table(values), decreasing = TRUE))[1]
+}
+cat("Most common annotated amino-acid change: ER-negative ",
+    most_common_site(tp53_negative, site_field), "; ER-positive ",
+    most_common_site(tp53_positive, site_field), ".\n", sep = "")
+# The plot shows the sites and mutation types in each group. Multiple calls
+# can occur in one patient, so call counts need not equal patient counts.
+```
+
+
+*5*
+Create your Overall_Survival_Status column and create a mafSurvival KM plot based on mutations in your chosen gene.
+Does there seem to be a difference? Hypothesize why or not based on the other analysis you did with the gene above.
+```{r maf-survival}
+# Dead = 1 (event), Alive = 0 (censored). Use death time for deaths and
+# last-contact time for patients who were alive at their last follow-up.
+vital <- tolower(trimws(as.character(clinic$vital_status)))
+clinic$Overall_Survival_Status <- ifelse(vital == "dead", 1L,
+                                         ifelse(vital == "alive", 0L, NA_integer_))
+to_number <- function(x) suppressWarnings(as.numeric(as.character(x)))
+clinic$survival_days <- ifelse(clinic$Overall_Survival_Status == 1L,
+                               to_number(clinic$death_days_to),
+                               to_number(clinic$last_contact_days_to))
+survival_clinic <- clinic[clinic$Tumor_Sample_Barcode %in% maf_samples &
+                            !is.na(clinic$Overall_Survival_Status) &
+                            is.finite(clinic$survival_days) & clinic$survival_days > 0,
+                          c("Tumor_Sample_Barcode", "Overall_Survival_Status", "survival_days")]
+survival_clinic$TP53_status <- factor(
+  ifelse(survival_clinic$Tumor_Sample_Barcode %in% tp53_samples, "Mutant", "WT"),
+  levels = c("Mutant", "WT"))
+if (any(table(survival_clinic$TP53_status) < 2L)) {
+  stop("The survival comparison needs at least two patients in each TP53 group.")
+}
+
+survival_file <- file.path(figure_dir, "TP53_mutant_vs_unmutated_overall_survival.png")
+grDevices::png(survival_file, width = 2000, height = 1500, res = 200)
+maftools::mafSurvival(maf = MAF_object,
+                      clinicalData = data.table::copy(survival_clinic),
+                      genes = "TP53", time = "survival_days",
+                      Status = "Overall_Survival_Status", isTCGA = FALSE)
+grDevices::dev.off()
+knitr::include_graphics(survival_file)
+
+survival_fit <- survival::survfit(
+  survival::Surv(survival_days, Overall_Survival_Status) ~ TP53_status,
+  data = survival_clinic)
+log_rank <- survival::survdiff(
+  survival::Surv(survival_days, Overall_Survival_Status) ~ TP53_status,
+  data = survival_clinic)
+survival_p <- stats::pchisq(log_rank$chisq, df = 1, lower.tail = FALSE)
+cat(sprintf("Log-rank p-value: %s.\n", format.pval(survival_p, digits = 3)))
+cat(if (survival_p < 0.05) {
+  "The curves provide evidence of different unadjusted overall survival.\n"
+} else {
+  "The curves do not provide clear evidence of different overall survival.\n"
+})
+# A difference could reflect TP53-associated tumor biology, subtype, stage,
+# or treatment differences. A null result could reflect limited follow-up,
+# few deaths, or a heterogeneous set of patients. Mutation association and
+# survival association do not by themselves establish a causal effect.
+```
