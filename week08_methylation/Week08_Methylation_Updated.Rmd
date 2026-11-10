@@ -1,0 +1,348 @@
+---
+title: "QBIO 490 — Week 08 Methylation: metastatic vs primary TCGA-BRCA"
+author: "Puyuan Li"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+---
+
+# Scope and reproducibility
+
+This revised notebook implements the **required** parts of the Fall 2026 methylation homework, based on `Fa26 Methylation Homework.pdf` and `Methylation_Data_DEMO.Rmd`. The comparison is **Metastatic minus Primary solid Tumor**, as labeled in the methylation `definition` metadata. These are specimen labels; primary tumors are **not** guaranteed to be from patients who never developed metastases. The analysis is observational and does not establish causality. The optional UCSC/literature extra credit is documented at the end, but requires manual browser evidence and is not claimed as completed.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=TRUE, message=TRUE)
+analysis_dir <- "/home1/puyuanli/490_cluster/analysis_data"
+output_dir <- "/home1/puyuanli/490_cluster/week08_methylation"
+stopifnot(dir.exists(analysis_dir))
+dir.create(output_dir, showWarnings=FALSE, recursive=TRUE)
+knitr::opts_knit$set(root.dir=analysis_dir)
+```
+
+## Packages and input checks
+
+```{r packages}
+needed <- c("TCGAbiolinks", "SummarizedExperiment", "limma", "DESeq2", "ggplot2")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop("Install missing packages before proceeding: ", paste(missing, collapse=", "), ". Use BiocManager::install() for Bioconductor packages.")
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(limma)
+library(DESeq2)
+library(ggplot2)
+```
+
+## Prepare only the required methylation sample types
+
+The instructor requests **Metastatic** and **Primary solid Tumor** specimens, not every TCGA-BRCA specimen. This query restricts the GDC file manifest to GDC sample types **Metastatic** and **Primary Tumor** before downloading. The labels in `colData(methylation450)$definition` remain the final authority for the analysis. The query can still contain many primary-tumor files: the assignment does not authorize arbitrarily selecting a small subset of patients.
+
+**Important:** The previous broad download placed files under `analysis_data/TCGA-BRCA/`, not necessarily under `analysis_data/GDCdata/`. Keep that directory intact. If you already have a prepared RDS, the following setup will reuse it. If not, run the next query/download chunk once, then run preparation. Do not run a second simultaneous download.
+
+```{r methylation-query}
+meth_rds <- file.path(analysis_dir, "brca_methylation450_se.rds")
+if (file.exists(meth_rds)) {
+  cat("Existing prepared methylation object found; skipping query/download.\n")
+} else {
+  meth_query <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "DNA Methylation",
+    data.type = "Methylation Beta Value",
+    platform = "Illumina Human Methylation 450",
+    data.format = "Dataframe",
+    sample.type = c("Primary Tumor", "Metastatic")
+  )
+  manifest <- getResults(meth_query)
+  cat("Requested files after sample-type restriction:", nrow(manifest), "\n")
+  if ("sample_type" %in% names(manifest)) print(table(manifest$sample_type, useNA="ifany"))
+  stopifnot(nrow(manifest) > 0)
+}
+```
+
+```{r methylation-download, eval=FALSE}
+# RUN MANUALLY ONLY IF the methylation RDS does not exist and the
+# RStudio Console is not already running a GDCdownload operation.
+# Existing correctly downloaded files in analysis_dir will be reused.
+#GDCdownload(meth_query, directory=analysis_dir, method="api", files.per.chunk=20)
+```
+
+```{r methylation-prepare}
+if (!file.exists(meth_rds)) {
+  if (!exists("meth_query")) stop("No prepared RDS and no query: run methylation-query first.")
+  methylation450 <- GDCprepare(meth_query, directory=analysis_dir)
+  saveRDS(methylation450, meth_rds)
+  cat("Saved prepared object:", meth_rds, "\n")
+} else {
+  methylation450 <- readRDS(meth_rds)
+}
+stopifnot(inherits(methylation450, "SummarizedExperiment"))
+cat("Methylation object dimensions:", paste(dim(methylation450),collapse=" x "), "\n")
+cat("Assays:", paste(assayNames(methylation450),collapse=", "), "\n")
+```
+
+## Select the two required specimen groups
+
+```{r methylation-groups}
+meth_meta <- as.data.frame(colData(methylation450))
+stopifnot("definition" %in% names(meth_meta))
+print(table(meth_meta$definition, useNA="ifany"))
+keep_m <- !is.na(meth_meta$definition) & meth_meta$definition %in% c("Metastatic", "Primary solid Tumor")
+meth_meta <- meth_meta[keep_m,,drop=FALSE]
+meth_meta$group <- factor(meth_meta$definition, levels=c("Primary solid Tumor","Metastatic"))
+stopifnot(all(table(meth_meta$group)>=2L))
+stopifnot(identical(rownames(meth_meta),colnames(methylation450)[keep_m]))
+print(table(meth_meta$group))
+```
+
+## Naive differential methylation (limma, CpG-level)
+
+The methylation response is a **logit2-transformed beta value (M-value)**, not a gene-expression log2 fold change. Values of exactly 0 or 1 are clipped to a small epsilon solely to avoid infinities. The estimated group coefficient is the difference in mean M-value between metastatic and primary specimens. The homework's 0.05 adjusted-p-value and absolute-effect-size threshold of 1 are used for the volcano plot, with the caveat that an M-value difference is not a conventional fold change.
+
+```{r methylation-limma}
+# Avoid converting the full assay into a large data.frame; work on a matrix.
+n_assays <- length(SummarizedExperiment::assays(methylation450))
+stopifnot(n_assays == 1L)
+assay_name <- 1L
+beta_all <- SummarizedExperiment::assay(
+  methylation450, i=assay_name, withDimnames=TRUE
+)
+beta <- as.matrix(beta_all[,keep_m,drop=FALSE])
+stopifnot(identical(colnames(beta),rownames(meth_meta)))
+stopifnot(is.numeric(beta), all(beta[is.finite(beta)]>=0 & beta[is.finite(beta)]<=1))
+# Allow some missing observations, but require >=2 observed values per group per CpG.
+grp <- meth_meta$group
+valid <- rowSums(is.finite(beta[,grp=="Primary solid Tumor",drop=FALSE]))>=2 &
+         rowSums(is.finite(beta[,grp=="Metastatic",drop=FALSE]))>=2
+beta <- beta[valid,,drop=FALSE]
+stopifnot(nrow(beta)>0)
+eps <- 1e-6
+beta_clip <- pmin(pmax(beta,eps),1-eps)
+mval <- log2(beta_clip/(1-beta_clip))
+mval[!is.finite(beta)] <- NA_real_
+rm(beta_clip, beta_all)
+gc(verbose=FALSE)
+mm <- model.matrix(~group, data=meth_meta)
+stopifnot(qr(mm)$rank==ncol(mm))
+fit <- eBayes(lmFit(mval,mm))
+coef_name <- grep("^groupMetastatic$",colnames(mm),value=TRUE)
+stopifnot(length(coef_name)==1)
+limma_table <- topTable(fit,coef=coef_name,number=Inf,sort.by="none",adjust.method="BH")
+limma_table$probe_id <- rownames(limma_table)
+limma_table$delta_beta <- rowMeans(beta[,grp=="Metastatic",drop=FALSE],na.rm=TRUE)-
+                          rowMeans(beta[,grp=="Primary solid Tumor",drop=FALSE],na.rm=TRUE)
+# Gene annotations come from the same SE row ranges, keyed by probe ID.
+probe_annotations <- as.data.frame(rowData(methylation450))
+cat("Annotation columns:",paste(names(probe_annotations),collapse=", "),"\n")
+if (!"gene" %in% names(probe_annotations)) stop("The methylation object lacks a gene annotation column. Inspect names(rowData(methylation450)) and the instructor demo before proceeding.")
+probe_annotations$probe_id <- rownames(methylation450)
+idx <- match(limma_table$probe_id,probe_annotations$probe_id)
+stopifnot(!anyNA(idx))
+limma_table$gene_name <- as.character(probe_annotations$gene[idx])
+# Do not misattribute probes mapped to multiple genes.
+limma_table$gene_name[grepl("[;,]",limma_table$gene_name)] <- NA_character_
+limma_table$gene_name[!nzchar(trimws(ifelse(is.na(limma_table$gene_name),"",limma_table$gene_name)))] <- NA_character_
+limma_table$significant <- !is.na(limma_table$adj.P.Val) & limma_table$adj.P.Val<0.05 & abs(limma_table$logFC)>=1
+cat("Tested CpG sites:",nrow(limma_table),"\n")
+cat("Significant CpGs (BH FDR<0.05, |delta M|>=1):",sum(limma_table$significant),"\n")
+write.csv(limma_table,file.path(analysis_dir,"brca_methylation_metastatic_vs_primary_limma.csv"),row.names=FALSE)
+```
+
+```{r methylation-volcano, fig.width=9, fig.height=6}
+volc <- limma_table
+volc$neglog10FDR <- -log10(pmax(volc$adj.P.Val,.Machine$double.xmin))
+volc$category <- ifelse(volc$significant & volc$logFC>0,"Hyper in metastatic",
+                        ifelse(volc$significant & volc$logFC<0,"Hypo in metastatic","Not significant"))
+p1 <- ggplot(volc,aes(logFC,neglog10FDR,color=category))+
+  geom_point(alpha=.45,size=.55,na.rm=TRUE)+
+  geom_vline(xintercept=c(-1,1),linetype="dashed")+
+  geom_hline(yintercept=-log10(.05),linetype="dashed")+
+  scale_color_manual(values=c("Hyper in metastatic"="#B2182B","Hypo in metastatic"="#2166AC","Not significant"="grey70"))+
+  labs(title="TCGA-BRCA CpG methylation: metastatic vs primary",
+       subtitle="Naive limma model; BH FDR < 0.05 and absolute delta M >= 1",
+       x="Metastatic minus primary: difference in M-value",y="-log10(BH-adjusted p-value)",color=NULL)+
+  theme_bw()
+print(p1)
+ggsave(file.path(output_dir,"brca_methylation_volcano.png"),p1,width=9,height=6,dpi=180)
+```
+
+### Part 1 interpretation (automatically populated after execution)
+
+```{r part1-interpretation, results='asis'}
+n_up <- sum(limma_table$significant & limma_table$logFC>0)
+n_down <- sum(limma_table$significant & limma_table$logFC<0)
+cat(sprintf("Across the two TCGA-BRCA specimen categories, the CpG-level model identified **%s CpG sites with higher methylation M-values in metastatic specimens** and **%s with lower M-values**, using BH-adjusted p < 0.05 and an absolute M-value difference of at least 1. ",format(n_up,big.mark=","),format(n_down,big.mark=",")))
+cat("These associations indicate that some measured CpG sites differ between the sampled groups, but the plot alone does not show that the differences caused metastasis. ")
+cat("In particular, the 'Primary solid Tumor' label does not establish that a patient never developed metastatic disease, and sampling site, tumor purity, clinical confounding, and unequal group sizes can affect the comparison. ")
+cat("The model is unadjusted, so its results should be treated as exploratory rather than patient-level causal or prognostic conclusions.\n")
+```
+
+# Part 2 — Differential RNA expression and gene intersection
+
+**Do not reuse the Week 7 tumor-versus-normal DESeq results as if they were metastatic-versus-primary.** We refit using RNA counts from Week 7 and **methylation sample metadata** for group assignment. Only exact TCGA sample-level matches (first 16 barcode characters, including sample type and vial) are accepted. If no RNA samples represent both groups, the analysis must stop rather than manufacture a comparison.
+
+```{r rna-inputs}
+rna_counts_path <- file.path(analysis_dir,"brca_rna_count_data.csv")
+rna_genes_path <- file.path(analysis_dir,"brca_rna_gene_data.csv")
+stopifnot(file.exists(rna_counts_path),file.exists(rna_genes_path))
+rna_counts <- read.csv(rna_counts_path,row.names=1,check.names=FALSE)
+rna_genes <- read.csv(rna_genes_path,check.names=FALSE)
+stopifnot(all(c("gene_id","gene_name") %in% names(rna_genes)))
+stopifnot(!anyDuplicated(rownames(rna_counts)))
+# TCGA sample-level identifiers: TCGA-XX-XXXX-01A (16 chars).
+sample_key <- function(x) substr(as.character(x),1,16)
+meth_key <- sample_key(rownames(meth_meta))
+stopifnot(all(grepl("^TCGA-",meth_key)))
+rna_key <- sample_key(colnames(rna_counts))
+stopifnot(all(grepl("^TCGA-",rna_key)))
+# Disallow ambiguous methylation annotations or duplicate RNA aliquots for same sample.
+unique_m <- !duplicated(meth_key) & !duplicated(meth_key,fromLast=TRUE)
+unique_r <- !duplicated(rna_key) & !duplicated(rna_key,fromLast=TRUE)
+idx_m <- match(rna_key,meth_key)
+matched <- !is.na(idx_m) & unique_r & unique_m[pmax(idx_m,1)]
+cat("Unambiguous sample-level RNA/methylation matches:",sum(matched),"\n")
+matched_counts <- as.matrix(rna_counts[,matched,drop=FALSE])
+if (!any(matched)) stop("No unambiguous exact 16-character sample matches between RNA and methylation. A valid metastatic-versus-primary DESeq2 model cannot be inferred from the Week 7 tumor/normal results. Consult the TA about the intended sample matching strategy.")
+matched_meta <- meth_meta[idx_m[matched],,drop=FALSE]
+rownames(matched_meta) <- colnames(matched_counts)
+stopifnot(identical(colnames(matched_counts),rownames(matched_meta)))
+print(table(matched_meta$group))
+if (any(table(matched_meta$group)<2)) stop("Cannot fit a metastatic-versus-primary RNA model: fewer than two matched RNA samples in at least one group. Do not substitute Week 7 tumor/normal results. Consult the TA about the intended RNA matching strategy.")
+stopifnot(all(is.finite(matched_counts)),all(matched_counts>=0),all(matched_counts==round(matched_counts)))
+```
+
+```{r rna-deseq, cache=TRUE}
+# Required expression filter: total raw count >=20 across retained RNA samples.
+matched_counts <- matched_counts[rowSums(matched_counts)>=20,,drop=FALSE]
+stopifnot(nrow(matched_counts)>0)
+dds <- DESeqDataSetFromMatrix(countData=round(matched_counts),colData=matched_meta,design=~group)
+dds <- DESeq(dds)
+de_results <- as.data.frame(results(dds,contrast=c("group","Metastatic","Primary solid Tumor")))
+de_results$gene_id <- rownames(de_results)
+gene_idx <- match(de_results$gene_id,as.character(rna_genes$gene_id))
+if (anyNA(gene_idx)) {
+  strip_version <- function(x) sub("\\.[0-9]+$", "", as.character(x))
+  ref_ids <- strip_version(rna_genes$gene_id)
+  stopifnot(!anyDuplicated(ref_ids))
+  gene_idx <- match(strip_version(de_results$gene_id),ref_ids)
+}
+stopifnot(!anyNA(gene_idx))
+de_results$gene_name <- as.character(rna_genes$gene_name[gene_idx])
+write.csv(de_results,file.path(analysis_dir,"brca_metastatic_vs_primary_DESeq2.csv"),row.names=FALSE)
+saveRDS(dds,file.path(analysis_dir,"brca_metastatic_vs_primary_dds.rds"))
+cat("Genes tested:",nrow(de_results),"\n")
+print(summary(results(dds,contrast=c("group","Metastatic","Primary solid Tumor"))))
+```
+
+## Choose a hypermethylated, downregulated gene
+
+For gene selection, **downregulated** means RNA log2FC <= -1 and RNA BH FDR < 0.05; **hypermethylated** means CpG delta M >= 1 and CpG BH FDR < 0.05. These are the assignment's statistical thresholds, applied to the correct direction of each comparison. Because multiple CpGs can map to one gene, this is a candidate-generation step, not proof of promoter methylation or transcriptional silencing.
+
+```{r intersect-genes}
+downregulated <- unique(de_results$gene_name[!is.na(de_results$padj) & de_results$padj<.05 & de_results$log2FoldChange<=-1])
+hypermethylated <- unique(limma_table$gene_name[
+  !is.na(limma_table$gene_name) &
+  !is.na(limma_table$adj.P.Val) &
+  is.finite(limma_table$logFC) &
+  limma_table$adj.P.Val < 0.05 &
+  limma_table$logFC > 0
+])
+interest_genes <- sort(intersect(downregulated,hypermethylated))
+cat("Downregulated gene names:",length(downregulated),"\n")
+cat("Hypermethylated-associated gene names:",length(hypermethylated),"\n")
+cat("Intersected candidates:",length(interest_genes),"\n")
+print(head(interest_genes,25))
+if (!length(interest_genes)) stop("No gene passes both criteria; cannot legitimately select a gene for Part 2. Review sample matching and discuss with TA before changing thresholds.")
+# Deterministic candidate: strongest RNA adjusted p-value among intersected names.
+candidates <- de_results[
+  de_results$gene_name %in% interest_genes &
+  !is.na(de_results$padj) &
+  is.finite(de_results$log2FoldChange) &
+  de_results$padj < 0.05 &
+  de_results$log2FoldChange <= -1,
+  , drop=FALSE
+]
+candidates <- candidates[order(candidates$padj, -abs(candidates$log2FoldChange)),,drop=FALSE]
+GENE <- candidates$gene_name[1]
+cat("Selected gene:",GENE,"\n")
+write.csv(candidates,file.path(output_dir,"gene_candidates.csv"),row.names=FALSE)
+```
+
+## Gene-specific RNA box plot
+
+Normalized RNA counts are shown for the **matched RNA samples**; the methylation panel uses methylation samples. These are not assumed to be identical cohorts.
+
+```{r gene-rna-box, fig.width=7, fig.height=5}
+gene_ids <- de_results$gene_id[de_results$gene_name==GENE]
+# If several Ensembl IDs have same gene name, use the selected result's gene ID.
+gene_id <- candidates$gene_id[1]
+stopifnot(gene_id %in% rownames(dds))
+normalized <- counts(dds,normalized=TRUE)
+plot_rna <- data.frame(group=matched_meta$group,
+                       normalized_count=as.numeric(normalized[gene_id,]))
+p2 <- ggplot(plot_rna,aes(group,log2(normalized_count+1),fill=group))+
+  geom_boxplot(outlier.shape=NA,alpha=.65)+
+  geom_jitter(width=.14,height=0,alpha=.45,size=1)+
+  theme_bw()+theme(legend.position="none")+
+  labs(title=paste(GENE,"RNA expression"),x="Specimen group",y="log2(normalized RNA count + 1)")
+print(p2)
+ggsave(file.path(output_dir,"gene_rna_boxplot.png"),p2,width=7,height=5,dpi=180)
+```
+
+## Gene-specific CpG methylation bar plot
+
+Each bar shows the **mean beta value of one CpG probe**, separately by group. Error bars show standard errors; sites are not assumed to be promoters or independent biological replicates.
+
+```{r gene-methylation-bar, fig.width=10, fig.height=5}
+probe_ids <- limma_table$probe_id[!is.na(limma_table$gene_name) & limma_table$gene_name==GENE]
+probe_ids <- intersect(probe_ids,rownames(beta))
+stopifnot(length(probe_ids)>0)
+# Cap at 25 most significant sites for legibility; report this selection explicitly.
+ranked <- limma_table[!is.na(limma_table$gene_name) & limma_table$gene_name==GENE,,drop=FALSE]
+ranked <- ranked[order(ranked$adj.P.Val),,drop=FALSE]
+probe_ids <- head(intersect(ranked$probe_id,rownames(beta)),25)
+bar_data <- do.call(rbind,lapply(probe_ids,function(id) {
+  do.call(rbind,lapply(levels(grp),function(g) {
+    vals <- beta[id,grp==g]
+    vals <- vals[is.finite(vals)]
+    data.frame(probe=id,group=g,mean_beta=mean(vals),se=if(length(vals)>1) sd(vals)/sqrt(length(vals)) else NA_real_,n=length(vals))
+  }))
+}))
+bar_data$probe <- factor(bar_data$probe,levels=probe_ids)
+p3 <- ggplot(bar_data,aes(probe,mean_beta,fill=group))+
+  geom_col(position=position_dodge(width=.8),width=.75)+
+  geom_errorbar(aes(ymin=pmax(0,mean_beta-se),ymax=pmin(1,mean_beta+se)),
+                position=position_dodge(width=.8),width=.22,na.rm=TRUE)+
+  coord_cartesian(ylim=c(0,1))+theme_bw()+
+  theme(axis.text.x=element_text(angle=60,hjust=1))+
+  labs(title=paste(GENE,"CpG methylation (up to 25 CpGs)"),x="CpG probe",y="Mean beta value",fill="Specimen group")
+print(p3)
+ggsave(file.path(output_dir,"gene_methylation_barplot.png"),p3,width=10,height=5,dpi=180)
+write.csv(bar_data,file.path(output_dir,"gene_cpg_summary.csv"),row.names=FALSE)
+```
+
+### Part 2 interpretation (automatically populated after execution)
+
+```{r part2-interpretation, results='asis'}
+gene_row <- candidates[1,,drop=FALSE]
+cat(sprintf("The selected candidate **%s** has a metastatic-versus-primary RNA log2 fold change of **%.2f** (BH-adjusted p = %.3g) and at least one associated CpG with a positive metastatic-minus-primary methylation M-value difference meeting the specified thresholds. ",GENE,gene_row$log2FoldChange,gene_row$padj))
+cat("The box plot compares normalized RNA abundance in the matched RNA samples, whereas the CpG bar plot displays site-specific mean beta values in the methylation cohort; the two panels need not include identical patients. ")
+cat("This pattern is compatible with an inverse methylation-expression association but does not demonstrate that methylation represses this gene, because annotated CpGs may lie outside its promoter and other regulatory mechanisms may contribute. ")
+cat("The groups represent specimen types rather than confirmed lifetime metastatic versus non-metastatic patient histories, and differences in sampling, cohort composition, and tumor purity limit causal interpretation.\n")
+```
+
+## Final checks
+
+```{r verify}
+expected <- c("brca_methylation_volcano.png","gene_rna_boxplot.png","gene_methylation_barplot.png","gene_candidates.csv","gene_cpg_summary.csv")
+stopifnot(all(file.exists(file.path(output_dir,expected))))
+stopifnot(file.exists(file.path(analysis_dir,"brca_methylation_metastatic_vs_primary_limma.csv")),
+          file.exists(file.path(analysis_dir,"brca_metastatic_vs_primary_DESeq2.csv")),
+          file.exists(file.path(analysis_dir,"brca_metastatic_vs_primary_dds.rds")))
+stopifnot(identical(colnames(beta),rownames(meth_meta)),
+          identical(colnames(matched_counts),rownames(matched_meta)))
+cat("All required outputs exist and methylation/RNA sample alignments passed.\n")
+```
+
+# Optional extra credit — NOT automatically completed
+
+For up to three genes, manually capture UCSC Genome Browser screenshots showing CpG islands and protein annotations. Required browser tracks: **GENCODE V49: dense; MANE: pack; UniProt: dense; EPDnewPromoters: dense; CpG Islands: show**. Record the genome assembly, coordinates, and source of each screenshot. For at least one gene, cite a real peer-reviewed research or review article, explain whether it agrees with your results, and discuss disagreement. Do not claim this extra credit without screenshots and a verified reference.
